@@ -1,0 +1,1 @@
+pm2 start --name "mantis-miner-237" "python miner.py --wallet-name tm_sn123_ck_mainnet_1 --hotkey-name tm_sn123_hk_mainnet_1 --continuous"
