@@ -1,155 +1,232 @@
+#!/usr/bin/env python3
+"""
+Miner Evaluator
+
+This script evaluates a specific miner by:
+1. Fetching payloads from a fixed URL
+2. Processing them like a validator
+3. Using simplified datalog.append_step(asset_prices, payload)
+"""
+
+from __future__ import annotations
+
 import argparse
-import gzip
-import json
 import logging
 import os
+import threading
+import time
+import asyncio
+import copy
+import json
+import gzip
 import pickle
-from typing import Dict, Any
 
-import numpy as np
+import bittensor as bt
+import torch
+import aiohttp
+from dotenv import load_dotenv
 
 import config
+from model import salience as sal_fn
 from storage import DataLog
-import model
+import comms
 
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(_BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
-def get_embeddings(block_number: int) -> Dict[str, np.ndarray]:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(LOG_DIR, "evaluate_miner.log"), mode="a"),
+    ],
+)
+
+weights_logger = logging.getLogger("weights")
+weights_logger.setLevel(logging.DEBUG)
+weights_logger.addHandler(
+    logging.FileHandler(os.path.join(LOG_DIR, "evaluate_weights.log"), mode="a")
+)
+
+for noisy in ("websockets", "aiohttp"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+load_dotenv()
+
+os.makedirs(config.STORAGE_DIR, exist_ok=True)
+DATALOG_PATH = os.path.join(config.STORAGE_DIR, "evaluate_datalog.pkl.gz")
+SAVE_INTERVAL = 120
+
+async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
+    """Fetch asset prices from the configured URL."""
+    try:
+        async with session.get(config.PRICE_DATA_URL) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            data = json.loads(text)
+            prices = data.get("prices", {})
+            logging.info(f"Fetched prices for {len(prices)} assets: {prices}")
+            return prices
+    except Exception as e:
+        logging.error(f"Failed to fetch prices from {config.PRICE_DATA_URL}: {e}")
+        return {}
+
+async def get_fixed_payloads(fixed_url: str) -> dict[int, dict]:
     """
-    User-provided hook to generate embeddings for a miner at a specific block.
-
-    Parameters
-    - block_number: the chain block number corresponding to a timestep we want
-      to generate embeddings for.
-
-    Returns
-    - A mapping of asset -> ndarray[emb_dim]. For now this stub just returns zeros
-      for every configured asset.
+    Fetch payloads from a fixed URL instead of from all miners.
+    
+    Args:
+        fixed_url: The URL to fetch payloads from
+        
+    Returns:
+        Dictionary with a single entry for the fixed miner
     """
-    out: Dict[str, np.ndarray] = {}
-    for asset in config.ASSETS:
-        emb_dim = int(config.ASSET_EMBEDDING_DIMS[asset])
-        out[asset] = np.zeros((emb_dim,), dtype=np.float16)
-    return out
-
-
-def _load_datalog(archive_path: str | None, prefer_local: bool) -> DataLog:
-    os.makedirs(config.STORAGE_DIR, exist_ok=True)
-    path = archive_path or os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
-    logger = logging.getLogger("loader")
-    if prefer_local and os.path.exists(path):
-        logger.info("Loading local datalog from %s", path)
-        try:
-            with gzip.open(path, "rb") as f:
-                log = pickle.load(f)
-            try:
-                log.raw_payloads = {}
-                logger.info("Pruned raw_payloads after local load (prefer_local).")
-            except Exception:
-                pass
-            return log
-        except Exception as e:
-            logger.warning("Local load failed (%s). Falling back to download.", e)
-    return DataLog.load(path)
-
-
-def _inject_miner_embeddings(
-    multi_asset_data: Dict[str, tuple[dict[int, list], list[float], list[int]]],
-    target_uid: int,
-    last_days: float,
-) -> Dict[str, tuple[dict[int, list], list[float], list[int]]]:
-    """
-    For each asset, ensure the target_uid exists and inject embeddings only in the
-    last `last_days` days of the timeline (earlier entries remain zeros).
-    """
-    seconds_per_block = 12
-    last_blocks = int(round((last_days * 24 * 60 * 60) / seconds_per_block))
-
-    out: Dict[str, tuple[dict[int, list], list[float], list[int]]] = {}
-
-    for asset, (history_dict, returns, blocks) in multi_asset_data.items():
-        # Determine mask for last_days
-        if blocks and last_blocks > 0:
-            cutoff_block = blocks[-1] - last_blocks
-            mask = (np.asarray(blocks, dtype=np.int64) >= cutoff_block)
+    payloads = {}
+    
+    try:
+        # Download payload from fixed URL
+        payload_raw = await comms.download(fixed_url, max_size_bytes=25 * 1024 * 1024)
+        if payload_raw:
+            # Use a dummy UID (999) for the fixed miner
+            payloads[999] = payload_raw
+            logging.info(f"Successfully downloaded payload from {fixed_url}")
         else:
-            mask = np.zeros(len(blocks), dtype=bool)
+            logging.warning(f"No payload data received from {fixed_url}")
+    except Exception as e:
+        logging.error(f"Failed to download payload from {fixed_url}: {e}")
+    
+    return payloads
 
-        emb_dim = int(config.ASSET_EMBEDDING_DIMS[asset])
-        T = len(returns)
+async def decrypt_loop(datalog: DataLog, stop_event: asyncio.Event):
+    """Background loop for decrypting payloads."""
+    logging.info("🔓 Starting decrypt loop.")
+    while not stop_event.is_set():
+        try:
+            await datalog.decrypt_step()
+            await asyncio.sleep(1)
+        except Exception as e:
+            logging.error(f"Error in decrypt loop: {e}")
+            await asyncio.sleep(5)
+    logging.info("⏹️ Decrypt loop stopped.")
 
-        # Prepare a zero array for the entire timeline for the target UID
-        target_arr = np.zeros((T, emb_dim), dtype=np.float16)
+async def save_loop(datalog: DataLog, do_save: bool, stop_event: asyncio.Event):
+    """Background loop for saving datalog."""
+    logging.info("💾 Starting save loop.")
+    while not stop_event.is_set():
+        try:
+            if do_save:
+                await datalog.save(DATALOG_PATH)
+            await asyncio.sleep(SAVE_INTERVAL)
+        except Exception as e:
+            logging.error(f"Error in save loop: {e}")
+            await asyncio.sleep(10)
+    logging.info("⏹️ Save loop stopped.")
 
-        # Populate only masked timesteps by calling the user hook per block
-        for t_idx in range(T):
-            if not mask[t_idx]:
-                continue
-            block_num = int(blocks[t_idx]) if t_idx < len(blocks) else None
-            try:
-                emap = get_embeddings(block_num) if block_num is not None else {}
-            except Exception:
-                emap = {}
-            vec = emap.get(asset)
-            if vec is None:
-                continue
-            try:
-                row = np.asarray(vec, dtype=np.float16).reshape(-1)
-            except Exception:
-                continue
-            if row.ndim == 1 and row.shape[0] == emb_dim:
-                target_arr[t_idx, :] = row
+async def main():
+    p = argparse.ArgumentParser(description="Evaluate a specific miner using fixed URL")
+    p.add_argument("--fixed-url", required=True, help="Fixed URL to fetch payloads from")
+    p.add_argument("--network", default="finney")
+    p.add_argument("--netuid", type=int, default=config.NETUID)
+    args = p.parse_args()
+
+    while True:
+        try:
+            sub = bt.subtensor(network=args.network)
+            mg = bt.metagraph(netuid=args.netuid, network=args.network, sync=True)
+            break
+        except Exception as e:
+            logging.error(f"Failed to initialize Bittensor components: {e}")
+            time.sleep(5)
+
+    # Initialize datalog
+    datalog = DataLog()
+    
+    if args.archive is None:
+        args.archive = DATALOG_PATH
+    
+    if not args.no_download_datalog:
+        try:
+            if args.prefer_local and os.path.exists(args.archive):
+                logging.info(f"Loading local datalog from {args.archive}")
+                datalog.load(args.archive)
             else:
-                logging.getLogger("evaluate_miner").warning(
-                    "Ignoring embedding for asset %s at block %s due to shape %s (expected %d)",
-                    asset, str(block_num), getattr(row, "shape", None), emb_dim,
-                )
+                logging.info("Downloading datalog from archive...")
+                datalog.download_and_load(config.DATALOG_ARCHIVE_URL, args.archive)
+        except Exception as e:
+            logging.warning(f"Failed to load datalog: {e}")
+            logging.info("Starting with fresh datalog.")
 
-        new_hist = dict(history_dict)
-        new_hist[target_uid] = target_arr
-        out[asset] = (new_hist, returns, blocks)
+    # Initialize metagraph data
+    await datalog.sync_miners(dict(zip(mg.uids.tolist(), mg.hotkeys)))
+    datalog.compute_and_display_uid_ages()
 
-    return out
+    # Main evaluation loop
+    stop_event = asyncio.Event()
+    
+    tasks = [
+        asyncio.create_task(decrypt_loop(datalog, stop_event)),
+        asyncio.create_task(save_loop(datalog, args.do_save, stop_event)),
+    ]
 
+    async with aiohttp.ClientSession() as session:
+        while not stop_event.is_set():
+            try:
+                current_block = sub.get_current_block()
+                
+                if current_block % config.SAMPLE_STEP != 0:
+                    await asyncio.sleep(1)
+                    continue
+                    
+                logging.info(f"Evaluating block {current_block}")
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--archive", type=str, default=None, help="Path to local datalog .pkl.gz (defaults to STORAGE_DIR/mantis_datalog.pkl.gz)")
-    ap.add_argument("--prefer_local", action="store_true", help="If set, load existing local archive if it exists; otherwise download")
-    ap.add_argument("--uid", type=int, default=0, help="Target UID to evaluate (default: 0)")
-    ap.add_argument("--last_days", type=float, default=15.0, help="Simulate embeddings only in the last N days (earlier entries zeros)")
-    args = ap.parse_args()
+                # Fetch asset prices
+                asset_prices = await get_asset_prices(session)
+                if not asset_prices:
+                    logging.error("Failed to fetch prices for required assets.")
+                    await asyncio.sleep(5)
+                    continue
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logger = logging.getLogger("evaluate_miner")
+                # Fetch payloads from fixed URL
+                payloads = await get_fixed_payloads(args.fixed_url)
+                
+                # Use simplified append_step (without block number)
+                await datalog.append_step(asset_prices, payloads)
 
-    # Load (or download) datalog and build training data
-    log = _load_datalog(args.archive, args.prefer_local)
-    logger.info("Preparing training data from datalog...")
-    multi_asset_data = log.get_training_data()
-    if not multi_asset_data:
-        logger.error("No training data available.")
-        return
+                # Calculate weights periodically
+                if (
+                    current_block % config.TASK_INTERVAL == 0
+                    and len(datalog.blocks) >= config.LAG * 2 + 1
+                ):
+                    logging.info("Calculating weights for evaluation...")
+                    
+                    # Get training data
+                    max_block_for_training = current_block - config.TASK_INTERVAL
+                    async with datalog._lock:
+                        training_data = datalog.get_training_data(max_block_number=max_block_for_training)
+                        uid_ages = datalog.uid_age_in_blocks
 
-    # Ensure FP16 numpy arrays to save memory downstream
-    logger.info("Converting training data to float16 structures...")
-    multi_asset_data = model.convert_multi_asset_data_to_np16(multi_asset_data)
+                    if training_data:
+                        # Calculate salience
+                        sal = sal_fn(training_data)
+                        logging.info(f"Salience calculation completed. Top weights: {dict(list(sal.items())[:5])}")
+                    else:
+                        logging.warning("Not enough data for salience calculation.")
 
-    # Inject the miner's embeddings for the last N days
-    logger.info("Injecting miner embeddings for UID %d over last %.1f days...", args.uid, args.last_days)
-    injected = _inject_miner_embeddings(multi_asset_data, target_uid=args.uid, last_days=args.last_days)
+                await asyncio.sleep(1)
 
-    # Compute weights
-    logger.info("Computing salience-based weights...")
-    weights = model.salience(injected)
-    if not weights:
-        logger.error("Empty weights computed; the evaluation window may be too short or data is insufficient.")
-        return
-
-    # Report target UID share
-    target_weight = float(weights.get(args.uid, 0.0))
-    logger.info("UID %d weight: %.6f (%.2f%%)", args.uid, target_weight, target_weight * 100.0)
-    print(json.dumps({"uid": args.uid, "weight": target_weight, "percent": target_weight * 100.0}, indent=2))
-
+            except KeyboardInterrupt:
+                stop_event.set()
+            except Exception as e:
+                logging.error(f"Error in evaluation loop: {e}", exc_info=True)
+                await asyncio.sleep(10)
+    
+    logging.info("Evaluation loop finished. Cleaning up background tasks.")
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main())
