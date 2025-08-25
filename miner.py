@@ -282,10 +282,10 @@ class MantisMiner:
             info = response.json()
             
             # Calculate future round (~30 seconds ahead)
-            future_time = time.time() + 1
+            future_time = time.time() + 12
             target_round = int((future_time - info["genesis_time"]) // info["period"])
             
-            logger.debug(f"Target round: {target_round}")
+            logger.info(f"Target round: {target_round}, info: {info}")
             return target_round
             
         except Exception as e:
@@ -609,6 +609,19 @@ class MantisMiner:
             # Step 4: Upload to public URL
             public_url = self.upload_to_public_url(filepath)
             
+            async def _download_and_decrypt():
+                try:
+                    payload_raw = await comms.download(public_url, max_size_bytes=MAX_PAYLOAD_BYTES)
+                    return self.decrypt_payload(payload_raw)
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt payload for UID {237}: {e}")
+                    return None
+            
+            import asyncio
+            result = asyncio.run(_download_and_decrypt())
+            if result is None:
+                logger.warning(f"Returning None for UID {237} due to decryption failure")
+                        
             # Step 5: Commit URL to subnet (only if not commit_only mode)
             if not self.commit_only:
                 if (self.cycle_count == 1):
@@ -623,7 +636,7 @@ class MantisMiner:
             logger.error(f"Mining cycle failed: {e}")
             raise
     
-    def run_continuous_mining(self, interval_seconds: int = 30):
+    def run_continuous_mining(self, interval_seconds: int = 60):
         """
         Run continuous mining with specified interval.
         
@@ -671,7 +684,7 @@ def main():
     parser.add_argument("--public-url", required=False, default="", help="Base URL for hosting payload files (optional, uses automatic hosting)")
     parser.add_argument("--commit-only", action="store_true", help="Only commit URL and exit")
     parser.add_argument("--continuous", action="store_true", help="Run continuous mining")
-    parser.add_argument("--interval", type=int, default=30, help="Interval between cycles in seconds")
+    parser.add_argument("--interval", type=int, default=60, help="Interval between cycles in seconds")
     
     args = parser.parse_args()
     
