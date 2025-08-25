@@ -608,7 +608,7 @@ class MantisMiner:
             
             # Step 4: Upload to public URL
             public_url = self.upload_to_public_url(filepath)
-            
+
             # Step 5: Commit URL to subnet (only if not commit_only mode)
             if not self.commit_only:
                 if (self.cycle_count == 1):
