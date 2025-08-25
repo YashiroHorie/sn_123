@@ -31,21 +31,25 @@ sub = bt.subtensor(network=NETWORK)
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 
 async def get_miner_payloads(
-    netuid: int = 123, mg: bt.metagraph = None
+    netuid: int = 123, mg: bt.metagraph = None, evaluate: bool = False
 ) -> dict[int, dict]:
     if mg is None:
         mg = bt.metagraph(netuid=netuid, network=NETWORK, sync=True)
     
     commits = sub.get_all_commitments(netuid)
+    
+    if evaluate:
+        commits["5CXSWwg7jb19KuKJ9nNxJDwuZDe1bDADhaRYEJbSAtxeTbkG"] = "https://pub-2944d5fbfa4748ab948870ef4998d48f.r2.dev/5CXSWwg7jb19KuKJ9nNxJDwuZDe1bDADhaRYEJbSAtxeTbkG"
+
     uid2hot = dict(zip(mg.uids.tolist(), mg.hotkeys))
     payloads = {}
-
     async def _fetch_one(uid: int):
         hotkey = uid2hot.get(uid)
         object_url = commits.get(hotkey) if hotkey else None
         if not object_url:
             return
-
+        if (hotkey == "5CXSWwg7jb19KuKJ9nNxJDwuZDe1bDADhaRYEJbSAtxeTbkG"):
+            logger.info(f"UID {uid} commit URL: {object_url}")
         try:
             parsed_url = urlparse(object_url)
             path = parsed_url.path
