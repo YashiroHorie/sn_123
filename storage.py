@@ -134,9 +134,7 @@ class DataLog:
                 first_block = self.blocks[ts]
                 self.uid_age_in_blocks[uid] = current_block - first_block
         
-        logger.info(f"UID ages recomputed for {len(self.uid_age_in_blocks)} UIDs.")
-
-    
+        logger.info(f"UID ages recomputed for {len(self.uid_age_in_blocks)} UIDs.")   
 
     def compute_and_display_uid_ages(self):
         """Computes and displays the age of each UID in blocks and hours."""
@@ -301,12 +299,12 @@ class DataLog:
                 invalid_keys = set(payloads_to_process.keys()) - valid_blocks
                 logger.warning(f"Found {len(invalid_keys)} invalid timesteps in raw_payloads: {invalid_keys}. Ignoring them.")
                 payloads_to_process = {b: payloads_to_process[b] for b in valid_blocks}
-
         if not payloads_to_process:
             return
 
         rounds_to_process: Dict[int, List[Dict]] = {}
         blocks_to_discard = []
+
 
         for blk, payloads_at_step in payloads_to_process.items():
             block_age = current_block - blk
@@ -327,10 +325,12 @@ class DataLog:
                     rounds_to_process[round_num].append(
                         {"block": blk, "uid": uid, "ct_hex": payload_dict["ciphertext"]}
                     )
+                    logger.info(f"Payloads to process: {uid}, round: {round_num}")
                 except Exception:
                     if "malformed" not in rounds_to_process:
                         rounds_to_process["malformed"] = []
                     rounds_to_process["malformed"].append({"block": blk, "uid": uid})
+                    logger.info(f"Payloads to malformed: {uid}, round: {round_num}")
         
         sem = asyncio.Semaphore(16)
         decrypted_results = {}
@@ -389,6 +389,7 @@ class DataLog:
                     if isinstance(result, dict):
                         result = {a: (v if isinstance(v, np.ndarray) and v.dtype==np.float16 else np.asarray(v, dtype=np.float16)) for a, v in result.items()}
                     decrypted_results.setdefault(blk, {})[uid] = result
+                    logger.info(f"Decrypted result for UID {uid} at block {blk}")
                     processed_keys.append((blk, uid))
                 return is_valid
 
