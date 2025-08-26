@@ -28,6 +28,7 @@ import numpy as np
 import requests
 from timelock import Timelock
 from dotenv import load_dotenv
+from transform_utils import transform_embeddings_by_name, get_available_transforms
 
 # Load environment variables
 load_dotenv()
@@ -78,7 +79,10 @@ class MantisMiner:
         wallet_name: str,
         hotkey_name: str,
         public_url_base: str,
-        commit_only: bool = False
+        commit_only: bool = False,
+        copy_uid: Optional[int] = None,
+        transform: Optional[str] = None,
+        transform_params: Optional[Dict] = None
     ):
         """
         Initialize the MANTIS miner.
@@ -88,12 +92,18 @@ class MantisMiner:
             hotkey_name: Bittensor hotkey name
             public_url_base: Base URL for hosting payload files
             commit_only: If True, only commit URL and exit
+            copy_uid: UID to copy embeddings from (if None, uses top miner)
+            transform: Name of transformation to apply to embeddings
+            transform_params: Additional parameters for transformation
         """
 
         self.wallet_name = wallet_name
         self.hotkey_name = hotkey_name
         self.public_url_base = public_url_base.rstrip('/')
         self.commit_only = commit_only
+        self.copy_uid = copy_uid
+        self.transform = transform
+        self.transform_params = transform_params or {}
         
         # Initialize Bittensor components
         self.wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
@@ -105,7 +115,9 @@ class MantisMiner:
         # Get hotkey for encryption and URL
         self.hotkey = self.wallet.hotkey.ss58_address
         logger.info(f"Initialized miner with hotkey: {self.hotkey}")
-        
+        logger.info(f"self.transform: {self.transform}")
+        logger.info(f"self.transform_params: {self.transform_params}")
+        logger.info(f"self.copy_uid: {self.copy_uid}")
         self._validate_registration()
         
         # Initialize timelock (cached for performance)
@@ -127,6 +139,13 @@ class MantisMiner:
         self._current_file_id = None
         
         logger.info(f"self.top_miner_uid: {self.top_miner_uid}")
+        
+        # Validate transform if specified
+        if self.transform:
+            available_transforms = get_available_transforms()
+            if self.transform not in available_transforms:
+                raise ValueError(f"Unknown transform: {self.transform}. Available: {list(available_transforms.keys())}")
+            logger.info(f"Using transform: {self.transform} with params: {self.transform_params}")
     
     def _cache_metagraph_data(self):
         """Cache metagraph data to avoid repeated API calls."""
@@ -174,22 +193,34 @@ class MantisMiner:
         # Check if we need to update the top miner UID (every 10 days)
         self._update_top_miner_uid_if_needed()
         
-        embeddings = self.copy_other_miner_data(miner_uid=self.top_miner_uid)
-        # embeddings = []
-        # for asset in ASSETS:
-        #     dim = ASSET_EMBEDDING_DIMS[asset]
-            
-        #     # TODO: Replace this with your actual model/prediction logic
-        #     # This is a placeholder that generates random embeddings
-        #     embedding = np.random.uniform(-1, 1, size=dim).tolist()
-            
-        #     # Validate embedding values are in [-1, 1] range
-        #     embedding = [max(-1.0, min(1.0, val)) for val in embedding]
-            
-        #     embeddings.append(embedding)
-        #     logger.debug(f"Generated {dim}-dim embedding for {asset}")
+        # Determine which UID to copy from
+        target_uid = self.copy_uid if self.copy_uid is not None else self.top_miner_uid
+        logger.info(f"Copying embeddings from UID: {target_uid}")
         
-        # logger.info(f"Generated embeddings for {len(ASSETS)} assets")
+        embeddings = self.copy_other_miner_data(miner_uid=target_uid)
+        # Apply transformation if specified
+        if self.transform and embeddings:
+            logger.info(f"Applying transform: {self.transform}")
+            try:
+                transformed_embeddings = transform_embeddings_by_name(
+                    embeddings, 
+                    self.transform, 
+                    **self.transform_params
+                )
+                
+                # Handle the transformed embeddings (already in list format)
+                embeddings = []
+                for asset_embedding in transformed_embeddings:
+                    # Clip to valid range [-1, 1]
+                    clipped_embedding = [max(-1.0, min(1.0, float(val))) for val in asset_embedding]
+                    embeddings.append(clipped_embedding)
+                
+                logger.info(f"Successfully applied {self.transform} transformation to {len(embeddings)} assets")
+                
+            except Exception as e:
+                logger.error(f"Failed to apply transform {self.transform}: {e}")
+                # Fall back to original embeddings
+                pass
         return embeddings
     
     def _update_top_miner_uid_if_needed(self):
@@ -442,7 +473,6 @@ class MantisMiner:
                         result.append([0.0] * expected_dim)
                 
                 logger.info(f"Successfully decrypted payload for round {round_num}")
-                logger.info(f"result: {result}")
                 return result
             else:
                 raise ValueError(f"Invalid submission format: {type(submission)}")
@@ -685,8 +715,18 @@ def main():
     parser.add_argument("--commit-only", action="store_true", help="Only commit URL and exit")
     parser.add_argument("--continuous", action="store_true", help="Run continuous mining")
     parser.add_argument("--interval", type=int, default=60, help="Interval between cycles in seconds")
+    parser.add_argument("--copy-uid", type=int, help="UID to copy embeddings from (default: top miner)")
+    parser.add_argument("--transform", help="Transformation to apply to embeddings")
+    parser.add_argument("--transform-params", type=json.loads, default={}, help="JSON string of transformation parameters")
     
     args = parser.parse_args()
+    # Validate transform parameters
+    if args.transform:
+        available_transforms = get_available_transforms()
+        if args.transform not in available_transforms:
+            logger.error(f"Unknown transform: {args.transform}")
+            logger.error(f"Available transforms: {list(available_transforms.keys())}")
+            return 1
     
     try:
         # Initialize miner
@@ -694,7 +734,10 @@ def main():
             wallet_name=args.wallet_name,
             hotkey_name=args.hotkey_name,
             public_url_base=args.public_url,
-            commit_only=args.commit_only
+            commit_only=args.commit_only,
+            copy_uid=args.copy_uid,
+            transform=args.transform,
+            transform_params=args.transform_params
         )
         
         if args.commit_only:

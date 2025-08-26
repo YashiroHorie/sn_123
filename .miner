@@ -1,0 +1,29 @@
+[
+  {
+    "NAME": "mantis-miner-237",
+    "SCRIPT": "miner.py",
+    "WALLET": "tm_sn123_ck_mainnet_1",
+    "HOTKEY": "tm_sn123_hk_mainnet_1",
+    "COPY_UID": 97,
+    "TRANSFORM": "",
+    "CONTINUOUS": true
+  },
+  {
+    "NAME": "mantis-miner-181",
+    "SCRIPT": "miner.py",
+    "WALLET": "tm_sn123_ck_mainnet_2",
+    "HOTKEY": "tm_sn123_hk_mainnet_2",
+    "COPY_UID": 138,
+    "TRANSFORM": "cubic",
+    "CONTINUOUS": true
+  },
+  {
+    "NAME": "mantis-miner-69",
+    "SCRIPT": "miner.py",
+    "WALLET": "tm_sn123_ck_mainnet_3",
+    "HOTKEY": "tm_sn123_hk_mainnet_3",
+    "COPY_UID": 94,
+    "TRANSFORM": "linear",
+    "CONTINUOUS": false
+  }
+]

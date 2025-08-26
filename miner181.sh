@@ -1,0 +1,1 @@
+pm2 start --name "mantis-miner-181" "python miner.py --wallet-name tm_sn123_ck_mainnet_2 --hotkey-name tm_sn123_hk_mainnet_2 --copy-uid 94 --transform tanh --continuous"
